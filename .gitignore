@@ -1,5 +1,4 @@
-echo "HEST/" >> .gitignore
-echo "hest_data/" >> .gitignore
-echo "FFPE Human Breast with Pre-designed Panel/" >> .gitignore
-echo "Pancreatic Cancer with Xenium Human Multi-Tissue and Cancer Panel/" >> .gitignore
-
+HEST/
+hest_data/
+FFPE Human Breast with Pre-designed Panel/
+Pancreatic Cancer with Xenium Human Multi-Tissue and Cancer Panel/
