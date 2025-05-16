@@ -47,7 +47,7 @@ class XeniumHEAligner:
         self.he_image = tifffile.imread(self.he_path)
         # Transpose from (C, H, W) to (H, W, C) if needed for standard image libraries
         if self.he_image.ndim == 3 and self.he_image.shape[0] in [3, 4]: # Check if first dim is channel
-             if self.he_image.shape[2] not in [3,4]: # Avoid transposing if already HWC
+            if self.he_image.shape[2] not in [3,4]: # Avoid transposing if already HWC
                 self.he_image = self.he_image.transpose(1, 2, 0)
                 print("Transposed H&E image to (H, W, C) format")
 
@@ -83,7 +83,6 @@ class XeniumHEAligner:
                 print(self.sdata)
                 print("------------------------------------")
 
-
             except Exception as e:
                 print(f"Error loading or creating Xenium SpatialData: {e}")
                 self._load_xenium_fallback()
@@ -94,9 +93,9 @@ class XeniumHEAligner:
 
         # Proceed with sdata if loaded successfully
         if self.sdata is None: # Should be caught by returns above, but as a safeguard
-             print("SpatialData object is None, cannot proceed with sdata dependent loading.")
-             self._load_xenium_fallback()
-             return
+            print("SpatialData object is None, cannot proceed with sdata dependent loading.")
+            self._load_xenium_fallback()
+            return
 
         # Load AnnData table for centroids
         if hasattr(self.sdata, 'tables') and 'table' in self.sdata.tables:
@@ -108,75 +107,120 @@ class XeniumHEAligner:
                 print(f"Loaded {len(self.centroids)} centroids from AnnData table.")
             else:
                 print("Spatial coordinates (obsm['spatial']) not found in AnnData table. Attempting fallback for centroids.")
-                # If centroids are not in table, Xenium standard often has them in shapes too.
-                # Or, one might load from a separate file if _load_xenium_fallback for centroids is desired.
-                # For now, let's assume if not in table, it might be an issue or require fallback for DAPI too.
-                self._load_xenium_fallback() # This will try to load centroids from parquet/csv
-                # If fallback loads centroids, self.centroids will be updated.
-                # Now, try to load DAPI from sdata if available, otherwise fallback already handled DAPI.
-                if self.xenium_dapi is None: # If fallback didn't set DAPI, try sdata images
+                self._load_xenium_fallback() 
+                if self.xenium_dapi is None: 
                     self._load_dapi_from_sdata() 
-                return # Exit load_data after this path
+                return 
         else:
             print("No 'table' found in SpatialData.tables. Attempting fallback.")
             self._load_xenium_fallback()
             return
 
-        # Load DAPI from sdata images if not already loaded by a fallback path that also loaded centroids
-        if self.xenium_dapi is None: # Check if DAPI needs to be loaded
+        if self.xenium_dapi is None: 
             self._load_dapi_from_sdata()
-
 
     def _load_dapi_from_sdata(self):
         """Helper to load DAPI from self.sdata.images"""
         if not hasattr(self.sdata, 'images') or not self.sdata.images:
             print("No 'images' found in SpatialData or images are empty. Attempting fallback for DAPI.")
-            self._load_xenium_fallback_dapi_only() # A more targeted fallback
+            self._load_xenium_fallback_dapi_only()
             return
 
         selected_image_key = None
-        if 'morphology_focus' in self.sdata.images:
+        # Prioritize more specific DAPI names if they exist, then fall back to general morphology images
+        if 'morphology_dapi' in self.sdata.images: # Check for a specific DAPI channel name first
+            selected_image_key = 'morphology_dapi'
+        elif 'morphology_focus' in self.sdata.images:
             selected_image_key = 'morphology_focus'
         elif 'morphology_mip' in self.sdata.images:
             selected_image_key = 'morphology_mip'
-        # Add other potential DAPI keys if necessary, e.g., 'morphology_dapi'
-        elif 'morphology_dapi' in self.sdata.images: # As in original code
-            selected_image_key = 'morphology_dapi'
-
+        
         if selected_image_key:
             try:
-                print(f"Attempting to load '{selected_image_key}' from SpatialData images...")
+                print(f"Attempting to load DAPI using image key '{selected_image_key}' from SpatialData images...")
                 image_sdata_element = self.sdata.images[selected_image_key]  # This is a DataTree
 
-                # Access the highest resolution scale (usually 'scale0')
-                # Then access the DataArray within the Dataset (usually named same as selected_image_key)
-                # The DataArray is typically under DataTree -> Dataset (e.g. 'scale0') -> DataArray (e.g. 'morphology_focus')
-                data_array = image_sdata_element['scale0'][selected_image_key]
+                # Check if 'scale0' (highest resolution) exists in the DataTree
+                if 'scale0' not in image_sdata_element:
+                    available_scales = list(image_sdata_element.keys())
+                    print(f"Error: 'scale0' not found in DataTree for image '{selected_image_key}'. Available scales/nodes: {available_scales}")
+                    if not available_scales:
+                        print(f"No scales found in DataTree for '{selected_image_key}'.")
+                    self._load_xenium_fallback_dapi_only()
+                    return
                 
-                numpy_array = data_array.compute().values
+                dataset_at_scale0 = image_sdata_element['scale0'] # This should be an xarray.Dataset
                 
-                # Images are stored as CYX. If it's a single channel DAPI, squeeze the channel dim.
-                if numpy_array.ndim == 3 and numpy_array.shape[0] == 1:  # CYX with C=1
-                    self.xenium_dapi = numpy_array.squeeze(axis=0)
-                elif numpy_array.ndim == 2:  # YX (already squeezed or no channel dim)
-                    self.xenium_dapi = numpy_array
-                elif numpy_array.ndim == 3 and numpy_array.shape[0] > 1: # Multi-channel CYX
-                    print(f"Warning: Loaded {selected_image_key} is multi-channel with shape {numpy_array.shape}. Taking first channel as DAPI.")
-                    self.xenium_dapi = numpy_array[0] # Take the first channel
-                else:
-                    print(f"Warning: Loaded {selected_image_key} has an unexpected shape {numpy_array.shape}. Using as is.")
-                    self.xenium_dapi = numpy_array
+                print(f"Inspecting dataset at 'scale0' for image key '{selected_image_key}':")
+                print(f"  Dataset object type: {type(dataset_at_scale0)}")
+                
+                available_data_vars = list(dataset_at_scale0.data_vars.keys())
+                print(f"  Available DataArray(s) (variables) in this dataset: {available_data_vars}")
 
-                print(f"Loaded Xenium morphology image ({selected_image_key}) from sdata. Original DataArray shape: {data_array.shape}, processed to numpy shape: {self.xenium_dapi.shape}")
+                data_array_name_to_use = None
+                if not available_data_vars: # No data variables found in the dataset
+                    print(f"  Error: No DataArrays found in the dataset at 'scale0' for image key '{selected_image_key}'.")
+                    self._load_xenium_fallback_dapi_only()
+                    return
+                
+                # Strategy to find the correct DataArray name:
+                if selected_image_key in available_data_vars: 
+                    # Ideal case: DataArray name matches the image element key
+                    data_array_name_to_use = selected_image_key
+                    print(f"  Found DataArray with name matching the image key: '{data_array_name_to_use}'")
+                elif len(available_data_vars) == 1:
+                    # Common case: Only one DataArray in the Dataset, so use that
+                    data_array_name_to_use = available_data_vars[0]
+                    print(f"  Only one DataArray ('{data_array_name_to_use}') found in the dataset. Assuming this is the image data.")
+                else: 
+                    # Multiple DataArrays, and none match selected_image_key.
+                    potential_names = ['image', 'data'] # Common generic names
+                    for name in potential_names:
+                        if name in available_data_vars:
+                            data_array_name_to_use = name
+                            print(f"  Warning: DataArray name '{selected_image_key}' not found directly. Found a generic DataArray named '{data_array_name_to_use}'. Using this one.")
+                            break
+                    if not data_array_name_to_use: # Still not found a good candidate
+                        data_array_name_to_use = available_data_vars[0] # Fallback to the first one with a stronger warning
+                        print(f"  Warning: DataArray name '{selected_image_key}' not found. Multiple DataArrays exist: {available_data_vars}. Defaulting to use the FIRST one: '{data_array_name_to_use}'. THIS MIGHT NOT BE THE CORRECT DAPI CHANNEL/IMAGE.")
 
-            except KeyError as e:
-                print(f"Error accessing image data for {selected_image_key} in SpatialData (e.g., 'scale0' or DataArray name might be different, or key not found): {e}")
+                data_array = dataset_at_scale0[data_array_name_to_use]
+                
+                print(f"  Attempting to load numpy array from DataArray: '{data_array_name_to_use}' with shape {data_array.shape} and dims {data_array.dims}")
+                numpy_array = data_array.compute().values # Load data into memory
+                
+                # Standardize DAPI to 2D (H, W)
+                if numpy_array.ndim == 3 and data_array.dims == ('c', 'y', 'x'):
+                    if numpy_array.shape[0] == 1:  # Single channel (c=1, y, x)
+                        self.xenium_dapi = numpy_array.squeeze(axis=0) # (y,x)
+                    else: # Multi-channel (c>1, y, x)
+                        print(f"Warning: Loaded DataArray '{data_array_name_to_use}' from image key '{selected_image_key}' is multi-channel CYX (shape {numpy_array.shape}). Taking first channel as DAPI.")
+                        self.xenium_dapi = numpy_array[0, :, :] # Take the first channel (y,x)
+                elif numpy_array.ndim == 2:  # Already (y, x)
+                    self.xenium_dapi = numpy_array
+                else: 
+                    print(f"Warning: Loaded DataArray '{data_array_name_to_use}' from image key '{selected_image_key}' has an unhandled shape {numpy_array.shape} or dims {data_array.dims}. Trying to use as is if 2D, or first slice if 3D.")
+                    if numpy_array.ndim == 3: 
+                        self.xenium_dapi = numpy_array[0,:,:] if numpy_array.shape[0] < numpy_array.shape[-1] else numpy_array[:,:,0] 
+                    elif numpy_array.ndim == 2:
+                        self.xenium_dapi = numpy_array
+                    else:
+                        print(f"ERROR: DAPI image {data_array_name_to_use} could not be processed into a 2D array. Shape: {numpy_array.shape}")
+                        self._load_xenium_fallback_dapi_only()
+                        return
+
+                print(f"Successfully loaded and processed Xenium DAPI (DataArray:'{data_array_name_to_use}' from image key:'{selected_image_key}') from sdata. Final numpy shape: {self.xenium_dapi.shape}")
+
+            except KeyError as e: 
+                print(f"KeyError encountered while accessing image data for '{selected_image_key}' in SpatialData: {e}. This might relate to 'scale0' or the DataArray name within the dataset.")
                 self._load_xenium_fallback_dapi_only()
             except Exception as e:
-                print(f"An unexpected error occurred while loading {selected_image_key} from sdata: {e}")
+                import traceback
+                print(f"An unexpected error occurred while loading '{selected_image_key}' from sdata: {e}")
+                print(traceback.format_exc())
                 self._load_xenium_fallback_dapi_only()
         else:
-            print("No suitable morphology image key ('morphology_focus', 'morphology_mip', 'morphology_dapi') found in SpatialData images.")
+            print("No suitable morphology image key ('morphology_dapi', 'morphology_focus', 'morphology_mip') found in SpatialData images.")
             self._load_xenium_fallback_dapi_only()
 
     def _load_xenium_fallback_dapi_only(self):
@@ -184,37 +228,34 @@ class XeniumHEAligner:
         print("Falling back to direct DAPI image file loading...")
         dapi_candidates = list(self.xenium_path.glob("**/morphology_dapi.ome.tif"))
         if not dapi_candidates:
-            dapi_candidates = list(self.xenium_path.glob("**/morphology_focus.ome.tif")) # Common alternative name
+            dapi_candidates = list(self.xenium_path.glob("**/morphology_focus.ome.tif")) 
         
         if dapi_candidates:
             dapi_file_path = dapi_candidates[0]
             try:
                 dapi_img = tifffile.imread(dapi_file_path)
-                # Ensure DAPI is 2D (H, W)
                 if dapi_img.ndim == 3:
-                    if dapi_img.shape[0] == 1: # (1, H, W)
+                    if dapi_img.shape[0] == 1: 
                         dapi_img = dapi_img.squeeze(axis=0)
-                    elif dapi_img.shape[-1] == 1: # (H, W, 1)
+                    elif dapi_img.shape[-1] == 1: 
                         dapi_img = dapi_img.squeeze(axis=-1)
-                    else: # Potentially (C, H, W) or (H, W, C) with C > 1
+                    else: 
                         print(f"Warning: Fallback DAPI image {dapi_file_path} has shape {dapi_img.shape}. Taking first channel/slice.")
-                        dapi_img = dapi_img[0] if dapi_img.shape[0] < dapi_img.shape[-1] else dapi_img[..., 0] # Heuristic
+                        dapi_img = dapi_img[0] if dapi_img.shape[0] < dapi_img.shape[-1] else dapi_img[..., 0] 
                 
                 self.xenium_dapi = dapi_img
                 print(f"Loaded DAPI image from fallback: {dapi_file_path}, shape: {self.xenium_dapi.shape}")
             except Exception as e:
                 print(f"Error loading DAPI image from {dapi_file_path}: {e}")
-                self.xenium_dapi = None # Ensure it's None if loading fails
+                self.xenium_dapi = None 
         else:
             print("No DAPI image file (morphology_dapi.ome.tif or morphology_focus.ome.tif) found in fallback paths.")
             self.xenium_dapi = None
 
-
     def _load_xenium_fallback(self):
         print("Falling back to direct Xenium file loading (DAPI and centroids)...")
-        self._load_xenium_fallback_dapi_only() # Load DAPI using the specific helper
+        self._load_xenium_fallback_dapi_only() 
 
-        # Load centroids from parquet/csv
         centroid_candidates = list(self.xenium_path.glob("**/cells.parquet"))
         if not centroid_candidates:
             centroid_candidates = list(self.xenium_path.glob("**/cells.csv"))
@@ -223,29 +264,24 @@ class XeniumHEAligner:
             file_path = centroid_candidates[0]
             try:
                 df = pd.read_parquet(file_path) if file_path.suffix == ".parquet" else pd.read_csv(file_path)
-                # Common column names for Xenium centroids
                 coord_cols = None
                 if "x_centroid" in df.columns and "y_centroid" in df.columns:
                     coord_cols = ["x_centroid", "y_centroid"]
-                elif "vertex_x" in df.columns and "vertex_y" in df.columns: # For some Xenium outputs (cell boundaries)
-                    # If using vertices, one might need to calculate centroids
+                elif "vertex_x" in df.columns and "vertex_y" in df.columns: 
                     print(f"Found vertex coordinates in {file_path}. Consider calculating centroids if these are not already cell centers.")
-                    # For simplicity, if these are the only spatial coords, use them, but note they might not be centroids.
-                    # A groupby cell_id and mean of vertices could give centroids.
-                    # This example will just take them as is if no 'x_centroid' exists.
-                    if "cell_id" in df.columns: # A crude way to get one point per cell
+                    if "cell_id" in df.columns: 
                         df_centroids = df.groupby("cell_id")[["vertex_x", "vertex_y"]].mean().reset_index()
                         self.centroids = df_centroids[["vertex_x", "vertex_y"]].values
                         print(f"Calculated centroids from vertices in {file_path}. Found {len(self.centroids)} centroids.")
-                    else: # Cannot easily get centroids from raw vertices without cell_id
-                         print(f"Vertex columns found in {file_path} but no cell_id for grouping. Cannot derive centroids easily.")
-                         self.centroids = None
+                    else: 
+                        print(f"Vertex columns found in {file_path} but no cell_id for grouping. Cannot derive centroids easily.")
+                        self.centroids = None
 
-                if coord_cols and self.centroids is None: # If not already set by vertex logic
+                if coord_cols and self.centroids is None: 
                     self.centroids = df[coord_cols].values
                     print(f"Loaded {len(self.centroids)} centroids using columns {coord_cols} from {file_path}.")
                 
-                if self.centroids is None and not coord_cols : # If no standard centroid/vertex columns found
+                if self.centroids is None and not coord_cols : 
                     print(f"Standard centroid/vertex columns not found in {file_path}.")
 
             except Exception as e:
@@ -256,8 +292,7 @@ class XeniumHEAligner:
             self.centroids = None
         
         if self.centroids is not None:
-             self.centroids = np.array(self.centroids, dtype=np.float64)
-
+            self.centroids = np.array(self.centroids, dtype=np.float64)
 
     def preprocess_images(self):
         if self.he_image is None:
@@ -269,45 +304,36 @@ class XeniumHEAligner:
 
         print(f"Preprocessing images with scale factor {self.scale_factor}...")
 
-        # Convert H&E to grayscale
-        # Ensure H&E is 2D or 3D (RGB) before rgb2gray
-        if self.he_image.ndim == 3 and self.he_image.shape[-1] == 3: # HWC (RGB)
+        if self.he_image.ndim == 3 and self.he_image.shape[-1] == 3: 
             he_gray = color.rgb2gray(self.he_image)
-        elif self.he_image.ndim == 2: # Already grayscale
+        elif self.he_image.ndim == 2: 
             he_gray = self.he_image.astype(float)
-            if np.issubdtype(self.he_image.dtype, np.integer): # Rescale if integer
-                 he_gray = he_gray / np.iinfo(self.he_image.dtype).max if np.max(he_gray) > 1 else he_gray
+            if np.issubdtype(self.he_image.dtype, np.integer): 
+                he_gray = he_gray / np.iinfo(self.he_image.dtype).max if np.max(he_gray) > 1 else he_gray
         else:
             print(f"Error: H&E image has unexpected shape {self.he_image.shape} for grayscale conversion.")
             return None, None
         
-        he_gray = exposure.equalize_adapthist(he_gray) #CLAHE
+        he_gray = exposure.equalize_adapthist(he_gray) 
 
-        # Process Xenium DAPI image (should be 2D (H,W) by now)
         if self.xenium_dapi.ndim != 2:
             print(f"Error: Xenium DAPI image is not 2D (shape: {self.xenium_dapi.shape}) before processing.")
             return None, None
 
         dapi_gray = self.xenium_dapi.astype(float)
-        # Rescale intensity if not already in [0,1] range
         if np.max(dapi_gray) > 1.0 or np.min(dapi_gray) < 0.0:
-             dapi_gray = exposure.rescale_intensity(dapi_gray, in_range='image', out_range=(0, 1))
-        dapi_gray = exposure.equalize_adapthist(dapi_gray) #CLAHE
+            dapi_gray = exposure.rescale_intensity(dapi_gray, in_range='image', out_range=(0, 1))
+        dapi_gray = exposure.equalize_adapthist(dapi_gray) 
 
-        # Median filtering
-        # skimage.filters.median is generally robust
         he_gray = filters.median(he_gray)
         dapi_gray = filters.median(dapi_gray)
 
-        # Downsample both images
-        # Ensure centroids are also scaled if scale_factor is used for images
         original_centroids = None
         if self.centroids is not None:
-            original_centroids = self.centroids.copy() # Keep original if scaling is only for registration image
+            original_centroids = self.centroids.copy() 
 
-        if self.scale_factor != 1.0: # Apply scaling only if not 1.0
+        if self.scale_factor != 1.0: 
             print(f"Downsampling images by factor {self.scale_factor}...")
-            # cv2.resize expects (width, height) for dsize
             he_target_shape = (int(he_gray.shape[1] * self.scale_factor), int(he_gray.shape[0] * self.scale_factor))
             dapi_target_shape = (int(dapi_gray.shape[1] * self.scale_factor), int(dapi_gray.shape[0] * self.scale_factor))
 
@@ -318,23 +344,19 @@ class XeniumHEAligner:
             self.he_processed = he_gray_scaled
             self.xenium_processed = dapi_gray_scaled
 
-            # Scale centroids for registration if they exist and scale_factor is used for images
-            # These scaled centroids are used for finding the transformation
             if self.centroids is not None:
                 self.centroids_scaled_for_registration = original_centroids * self.scale_factor
                 print("Scaled centroids for registration to match downsampled image.")
             else:
                 self.centroids_scaled_for_registration = None
-
-        else: # No scaling
+        else: 
             self.he_processed = he_gray
             self.xenium_processed = dapi_gray
             if self.centroids is not None:
-                self.centroids_scaled_for_registration = original_centroids # Use original if no scaling
+                self.centroids_scaled_for_registration = original_centroids 
             else:
                 self.centroids_scaled_for_registration = None
             print(f"Processed image shapes (no downsampling): H&E = {self.he_processed.shape}, DAPI = {self.xenium_processed.shape}")
-
 
         return self.he_processed, self.xenium_processed
 
@@ -345,15 +367,14 @@ class XeniumHEAligner:
 
         print("Starting feature-based registration (ORB)...")
 
-        # Ensure images are uint8 for ORB
         img_xenium = cv2.normalize(self.xenium_processed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         img_he = cv2.normalize(self.he_processed, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-        orb = cv2.ORB_create(nfeatures=2000, scoreType=cv2.ORB_HARRIS_SCORE) # Example: trying HARRIS_SCORE
+        orb = cv2.ORB_create(nfeatures=2000, scoreType=cv2.ORB_HARRIS_SCORE) 
         kp1, des1 = orb.detectAndCompute(img_xenium, None)
         kp2, des2 = orb.detectAndCompute(img_he, None)
 
-        if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10: # Increased minimum features
+        if des1 is None or des2 is None or len(kp1) < 10 or len(kp2) < 10: 
             print("Not enough features detected in one or both images for ORB.")
             return None
 
@@ -364,12 +385,11 @@ class XeniumHEAligner:
             print("No matches found between features.")
             return None
 
-        # Sort matches by distance and take top N (e.g., 50 or more if available)
         matches = sorted(matches, key=lambda x: x.distance)
-        good_matches_count = min(len(matches), 100) # Use up to 100 good matches
+        good_matches_count = min(len(matches), 100) 
         matches_to_use = matches[:good_matches_count]
 
-        if len(matches_to_use) < 4: # Need at least 4 matches for homography
+        if len(matches_to_use) < 4: 
             print(f"Not enough good matches ({len(matches_to_use)}) for homography estimation.")
             return None
         
@@ -378,7 +398,6 @@ class XeniumHEAligner:
         src_pts = np.float32([kp1[m.queryIdx].pt for m in matches_to_use]).reshape(-1, 1, 2)
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches_to_use]).reshape(-1, 1, 2)
 
-        # Find homography using RANSAC
         h, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=5.0)
         
         if h is None:
@@ -386,21 +405,16 @@ class XeniumHEAligner:
             return None
 
         self.transform_matrix = h
-        self.transform_name = "homography_ORB" # More specific name
+        self.transform_name = "homography_ORB" 
 
-        # Draw matches for visualization
-        # Ensure mask is correctly applied if you want to draw only inliers
-        # For drawMatches, it usually takes the list of matches directly.
-        # If you want to show inliers, you might need to filter 'matches_to_use' based on 'mask'.
-        # However, cv2.drawMatches is often used with the raw matches list.
         match_img = cv2.drawMatches(img_xenium, kp1, img_he, kp2, matches_to_use, None,
                                     flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-        plt.figure(figsize=(16, 8)) # Increased size for better visibility
+        plt.figure(figsize=(16, 8)) 
         plt.imshow(match_img)
         plt.title(f"ORB Feature Matches (Xenium to H&E) - Top {len(matches_to_use)} Matches")
         plt.axis('off')
         plt.tight_layout()
-        plt.savefig(self.output_dir / "orb_matches.png", dpi=150) # Adjust dpi as needed
+        plt.savefig(self.output_dir / "orb_matches.png", dpi=150) 
         plt.close()
 
         print("Feature-based registration (ORB) complete. Transform matrix stored.")
@@ -410,45 +424,20 @@ class XeniumHEAligner:
         if self.transform_matrix is None:
             print("Error: Transform matrix not available. Run registration first.")
             return None
-        if self.centroids is None: # Use the original, unscaled centroids for final transformation
+        if self.centroids is None: 
             print("Error: Original centroids not available.")
             return None
 
         print("Transforming original centroids using the calculated transformation matrix...")
         n = self.centroids.shape[0]
         
-        # Centroids are (x, y). Homography expects (x, y, 1).
-        # Note: The transformation was found on scaled images.
-        # The transformation matrix 'h' maps points from the scaled Xenium space
-        # to the scaled H&E space.
-        # To apply this to original centroids:
-        # 1. Scale original centroids down (if scale_factor != 1.0).
-        # 2. Apply homography.
-        # 3. Scale transformed centroids back up to original H&E image resolution (if scale_factor != 1.0).
-        
-        # If self.centroids_scaled_for_registration was used to find 'h':
-        # This means 'h' maps from the space of self.centroids_scaled_for_registration
-        # to the space of self.he_processed.
-        
-        # Let P_orig be original Xenium centroids.
-        # P_scaled_xen = P_orig * scale_factor
-        # H maps P_scaled_xen to P_scaled_he
-        # P_scaled_he = H * P_scaled_xen
-        # To get P_final_he (centroids on original H&E image):
-        # P_final_he = P_scaled_he / scale_factor
-        
-        # So, if transform_matrix (h) was derived from scaled images:
-        # 1. Scale original Xenium centroids by self.scale_factor
         temp_scaled_centroids = self.centroids * self.scale_factor
         
-        # 2. Apply the homography matrix
-        pts_to_transform = np.hstack([temp_scaled_centroids, np.ones((n, 1))]) # Add homogeneous coordinate
+        pts_to_transform = np.hstack([temp_scaled_centroids, np.ones((n, 1))]) 
         transformed_pts_homog = (self.transform_matrix @ pts_to_transform.T).T
         
-        # Normalize homogeneous coordinates
         transformed_pts_scaled = transformed_pts_homog[:, :2] / transformed_pts_homog[:, 2][:, None]
         
-        # 3. Rescale back to the original H&E image's coordinate system
         if self.scale_factor != 1.0:
             self.aligned_centroids = transformed_pts_scaled / self.scale_factor
         else:
@@ -456,7 +445,6 @@ class XeniumHEAligner:
 
         print(f"Transformed {len(self.aligned_centroids)} centroids.")
         return self.aligned_centroids
-
 
     def visualize_alignment(self, n_points=1000, save_only=False, point_size=1, point_alpha=0.5):
         if self.he_image is None:
@@ -466,40 +454,35 @@ class XeniumHEAligner:
             print("Aligned centroids not available for visualization.")
             return
             
-        # Use the full resolution H&E image for visualization
         he_display_img = self.he_image
         if he_display_img.ndim == 3 and he_display_img.shape[-1] == 3 and np.issubdtype(he_display_img.dtype, np.floating):
-            # Potentially normalize if it's float [0,1] for imshow, or let matplotlib handle it
             pass
         elif np.issubdtype(he_display_img.dtype, np.integer):
-            # Ensure it's in a displayable range if integer, though matplotlib often handles this.
             pass
-
 
         print(f"Visualizing alignment of {n_points} sampled centroids...")
         num_centroids_to_sample = min(n_points, len(self.aligned_centroids))
         if len(self.aligned_centroids) > 0:
             indices = np.random.choice(len(self.aligned_centroids),
-                                   num_centroids_to_sample,
-                                   replace=False)
+                                       num_centroids_to_sample,
+                                       replace=False)
             sampled_centroids = self.aligned_centroids[indices]
         else:
             print("No aligned centroids to visualize.")
             sampled_centroids = np.array([])
 
-
-        plt.figure(figsize=(12, 12)) # Larger figure for detail
+        plt.figure(figsize=(12, 12)) 
         plt.imshow(he_display_img, cmap='gray' if he_display_img.ndim==2 else None)
         
         if sampled_centroids.any():
             plt.scatter(sampled_centroids[:, 0], sampled_centroids[:, 1], 
-                        s=point_size, c='red', alpha=point_alpha, edgecolors='none') # No distracting edges
+                        s=point_size, c='red', alpha=point_alpha, edgecolors='none') 
 
         plt.title(f"Aligned Xenium Cell Centroids on H&E Image (Sampled {num_centroids_to_sample} Points)")
-        plt.axis('on') # Show axes to verify coordinates if needed, or 'off' for cleaner image
+        plt.axis('on') 
         plt.xlabel("X-coordinate")
         plt.ylabel("Y-coordinate")
-        plt.gca().invert_yaxis() # Often needed for image coordinate systems
+        plt.gca().invert_yaxis() 
         plt.tight_layout()
 
         save_path = self.output_dir / "aligned_centroids_visualization.png"
@@ -513,31 +496,31 @@ class XeniumHEAligner:
 
 # Main execution block (if you want to run this script directly)
 if __name__ == '__main__':
-    # Get USER from environment or default to 'user'
-    user = os.getenv('USER', 'user') # For cross-platform compatibility, USER might not always be set.
-                                     # Consider getpass.getuser() if available and more robust.
+    user = os.getenv('USER', 'user') 
     
-    # Example paths - replace with your actual paths
-    base_cancer_path = Path(f"/Users/{user}/Cancer/FFPE Human Breast with Pre-designed Panel") # Adjust if path varies
+    base_cancer_path = Path(f"/Users/{user}/Cancer/FFPE Human Breast with Pre-designed Panel") 
     
-    # Check if the base path exists
     if not base_cancer_path.exists():
         print(f"Error: Base data path {base_cancer_path} does not exist. Please check the path.")
-        exit()
+        # exit() # It's good practice to exit if critical paths are missing
 
-    he_path = base_cancer_path / "Xenium_V1_FFPE_Human_Breast_IDC_he_image.ome.tif"
-    xenium_data_dir = base_cancer_path / "Xenium_V1_FFPE_Human_Breast_IDC_outs" # This is the directory for Xenium outputs
+    # he_path = base_cancer_path / "Xenium_V1_FFPE_Human_Breast_IDC_he_image.ome.tif"
+    # xenium_data_dir = base_cancer_path / "Xenium_V1_FFPE_Human_Breast_IDC_outs" 
 
-    # Check if specific files/dirs exist
+    # The user's original snippet ended here, so I'll add placeholder paths for completeness
+    # if the script were to be run. Actual paths need to be verified by the user.
+    he_path = base_cancer_path / "Xenium_V1_FFPE_Human_Breast_IDC_he_image.ome.tif" # Example
+    xenium_data_dir = base_cancer_path / "Xenium_V1_FFPE_Human_Breast_IDC_outs"   # Example
+
     if not he_path.exists():
         print(f"Error: H&E image not found at {he_path}")
-        exit()
+        # exit() 
     if not xenium_data_dir.exists() or not xenium_data_dir.is_dir():
         print(f"Error: Xenium data directory not found at {xenium_data_dir}")
-        exit()
+        # exit()
 
-    output_dir = Path("./alignment_output_breast_idc_corrected") # Changed output dir name
-    scale_factor_for_registration = 0.1 # Use a descriptive name
+    output_dir = Path("./alignment_output_breast_idc_corrected") 
+    scale_factor_for_registration = 0.1 
 
     print("Starting Xenium-H&E Alignment Pipeline...")
     aligner = XeniumHEAligner(he_path, xenium_data_dir, output_dir, scale_factor=scale_factor_for_registration)
@@ -545,7 +528,6 @@ if __name__ == '__main__':
     print("\nStep 1: Loading data...")
     aligner.load_data()
 
-    # Check if data loading was successful before proceeding
     if aligner.he_image is None or aligner.xenium_dapi is None:
         print("\nData loading failed. H&E or Xenium DAPI image is missing. Exiting pipeline.")
     elif aligner.centroids is None:

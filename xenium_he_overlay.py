@@ -89,55 +89,78 @@ def apply_inverse_affine_transform(xenium_centroids, transform_matrix):
     print("[DEBUG] Exiting apply_inverse_affine_transform")
     return he_coordinates
 
-
-def extract_image_patches(he_image, transformed_coords, patch_sizes=[256, 512, 1024], final_size=256):
+def extract_image_patches(he_image, transformed_coords,
+                          P=224,
+                          kappas=[0.5, 0.75, 1.0, 1.5, 2.0],
+                          resample_order=3):
     """
-    Extract image patches from H&E image at multiple zoom levels centered on transformed coordinates.
+    Extract 224×224 patches at zoom levels κ around each point, with detailed debug prints.
     """
-    print("[DEBUG] Entering extract_image_patches")
-    print(f"[DEBUG] he_image shape: {he_image.shape}")
-    print(f"[DEBUG] Number of coordinates: {transformed_coords.shape[0]}")
-    print(f"[DEBUG] Patch sizes: {patch_sizes}, final size: {final_size}")
-
+    H, W = he_image.shape[:2]
+    print(f"[DEBUG] Entering extract_image_patches: image shape=({H},{W}), "
+          f"num_points={len(transformed_coords)}, P={P}, kappas={kappas}")
+    
     patches = {}
-    image_height, image_width = he_image.shape[:2]
 
     for i, (x, y) in enumerate(transformed_coords):
-        x_int, y_int = int(round(x)), int(round(y))
-        print(f"[DEBUG] Processing point {i}: ({x_int}, {y_int})")
-
-        # Skip if the point is outside the image
-        if x_int < 0 or y_int < 0 or x_int >= image_width or y_int >= image_height:
-            print(f"[DEBUG] Point {i} is outside image bounds. Skipping.")
+        xi, yi = int(round(x)), int(round(y))
+        print(f"[DEBUG] Point {i}: rounded coords → (xi, yi)=({xi}, {yi})")
+        
+        # skip out‐of‐bounds
+        if not (0 <= xi < W and 0 <= yi < H):
+            print(f"[DEBUG] Point {i} is outside image bounds; skipping.")
             continue
 
         patches[i] = []
-        for patch_size in patch_sizes:
-            print(f"[DEBUG] Extracting patch of size {patch_size} for point {i}")
-            half_size = patch_size // 2
-            x_min = max(0, x_int - half_size)
-            y_min = max(0, y_int - half_size)
-            x_max = min(image_width, x_int + half_size)
-            y_max = min(image_height, y_int + half_size)
-            print(f"[DEBUG] Boundaries: x[{x_min}:{x_max}], y[{y_min}:{y_max}]")
+        for κ in kappas:
+            # compute raw patch size to crop
+            crop_size = int(np.ceil(P / κ))
+            half = crop_size // 2
+            print(f"[DEBUG]  κ={κ}: crop_size={crop_size}, half={half}")
 
-            patch = he_image[y_min:y_max, x_min:x_max]
+            x0 = max(0, xi - half)
+            y0 = max(0, yi - half)
+            x1 = min(W, xi + half)
+            y1 = min(H, yi + half)
+            print(f"[DEBUG]  crop bounds for κ={κ}: x[{x0}:{x1}], y[{y0}:{y1}]")
 
-            if patch.shape[0] != patch_size or patch.shape[1] != patch_size:
-                print(f"[DEBUG] Patch shape {patch.shape} smaller than expected. Padding.")
-                padded_patch = np.zeros((patch_size, patch_size, 3), dtype=he_image.dtype)
-                padded_patch[:patch.shape[0], :patch.shape[1]] = patch
-                patch = padded_patch
+            # crop
+            crop = he_image[y0:y1, x0:x1]
+            print(f"[DEBUG]  cropped shape for κ={κ}: {crop.shape}")
 
-            if patch_size != final_size:
-                print(f"[DEBUG] Resizing patch from {patch_size} to {final_size}")
-                patch = transform.resize(patch, (final_size, final_size), preserve_range=True).astype(he_image.dtype)
+            # pad if needed
+            pad_h = crop_size - crop.shape[0]
+            pad_w = crop_size - crop.shape[1]
+            if pad_h > 0 or pad_w > 0:
+                pad_top = max(0, half - yi)
+                pad_left = max(0, half - xi)
+                pad_bot = pad_h - pad_top
+                pad_right = pad_w - pad_left
+                print(f"[DEBUG]  padding needed for κ={κ}: "
+                      f"pad_h={pad_h}, pad_w={pad_w}, "
+                      f"top={pad_top}, bottom={pad_bot}, left={pad_left}, right={pad_right}")
+                crop = np.pad(crop,
+                              ((pad_top, pad_bot),
+                               (pad_left, pad_right),
+                               (0, 0)),
+                              mode='constant',
+                              constant_values=0)
+                print(f"[DEBUG]  padded shape for κ={κ}: {crop.shape}")
+
+            # resize back to P×P
+            patch = transform.resize(
+                crop,
+                (P, P),
+                order=resample_order,
+                preserve_range=True
+            ).astype(he_image.dtype)
+            print(f"[DEBUG]  resized patch shape for κ={κ}: {patch.shape}")
 
             patches[i].append(patch)
+
         print(f"[DEBUG] Extracted {len(patches[i])} patches for point {i}")
 
-    print(f"[DEBUG] Completed extract_image_patches. Total valid points: {len(patches)}")
-    print("[DEBUG] Exiting extract_image_patches")
+    print(f"[DEBUG] Exiting extract_image_patches: total valid points = {len(patches)}")
     return patches
 
 
