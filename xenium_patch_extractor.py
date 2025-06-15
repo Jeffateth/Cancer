@@ -161,8 +161,8 @@ class XeniumPatchExtractor:
         print(f"  75th percentile: {np.percentile(neighbor_counts, 75):.2f}")
 
     def apply_neighbor_density_filter(self, cells_df: pd.DataFrame, min_neighbors: int, radius: float, 
-                                    sample_name: str, visualize: bool = True) -> pd.DataFrame:
-        """Filter cells based on neighbor density."""
+                                    sample_name: str, visualize: bool = True) -> tuple:
+        """Filter cells based on neighbor density and return filtered info."""
         print(f"\nApplying neighbor density filter...")
         print(f"Parameters: min_neighbors={min_neighbors}, radius={radius}")
         print(f"Cells before neighbor filtering: {len(cells_df)}")
@@ -182,11 +182,81 @@ class XeniumPatchExtractor:
         neighbor_mask = neighbor_counts >= min_neighbors
         cells_df_filtered = cells_df[neighbor_mask].copy()
         
+        # Store filtered cells info for visualization
+        filtered_cells_info = {
+            'cells_df': cells_df[~neighbor_mask].copy(),
+            'neighbor_counts': neighbor_counts[~neighbor_mask],
+            'reason': 'neighbor_density'
+        }
+        
         print(f"Cells after neighbor filtering: {len(cells_df_filtered)}")
         print(f"Filtered out {len(cells_df) - len(cells_df_filtered)} isolated cells")
         
-        return cells_df_filtered
+        return cells_df_filtered, filtered_cells_info
 
+    def analyze_radius_effect(self, cells_df: pd.DataFrame, sample_name: str, radii_to_test=[25, 50, 75, 100]):
+        """Analyze how different radii affect neighbor counts."""
+        
+        coordinates = cells_df[['x_centroid', 'y_centroid']].values
+        print(f"\nAnalyzing radius effect for {sample_name}")
+        print(f"Total cells: {len(coordinates)}")
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        axes = axes.flatten()
+        
+        results = {}
+        
+        for i, radius in enumerate(radii_to_test):
+            print(f"\nRadius = {radius} microns:")
+            
+            # Count neighbors
+            neighbor_counts = self.count_neighbors_within_radius(coordinates, radius)
+            
+            # Statistics
+            stats = {
+                'mean': np.mean(neighbor_counts),
+                'median': np.median(neighbor_counts),
+                'std': np.std(neighbor_counts),
+                'q25': np.percentile(neighbor_counts, 25),
+                'q75': np.percentile(neighbor_counts, 75),
+                'zero_neighbors': np.sum(neighbor_counts == 0),
+                'pct_zero': np.sum(neighbor_counts == 0) / len(neighbor_counts) * 100
+            }
+            results[radius] = stats
+            
+            print(f"  Mean: {stats['mean']:.1f}")
+            print(f"  Median: {stats['median']:.1f}")
+            print(f"  Cells with 0 neighbors: {stats['zero_neighbors']} ({stats['pct_zero']:.1f}%)")
+            
+            # Plot histogram
+            ax = axes[i]
+            ax.hist(neighbor_counts, bins=50, alpha=0.7, edgecolor='black')
+            ax.axvline(stats['median'], color='red', linestyle='--', 
+                      label=f'Median: {stats["median"]:.1f}')
+            ax.axvline(stats['mean'], color='orange', linestyle='--', 
+                      label=f'Mean: {stats["mean"]:.1f}')
+            ax.set_xlabel('Number of neighbors')
+            ax.set_ylabel('Number of cells')
+            ax.set_title(f'Radius = {radius}μm')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.suptitle(f'{sample_name}: Neighbor counts at different radii', fontsize=16, y=1.02)
+        plt.show()
+        
+        # Summary table
+        print(f"\n{'='*60}")
+        print(f"RADIUS COMPARISON SUMMARY for {sample_name}")
+        print(f"{'='*60}")
+        print(f"{'Radius':>8} {'Mean':>8} {'Median':>8} {'%Zero':>8} {'Q25-Q75':>12}")
+        print(f"{'-'*60}")
+        for radius, stats in results.items():
+            print(f"{radius:>8} {stats['mean']:>8.1f} {stats['median']:>8.1f} "
+                  f"{stats['pct_zero']:>7.1f}% {stats['q25']:>4.0f}-{stats['q75']:<4.0f}")
+        
+        return results
+    
     def extract_patch_with_padding(self, he_stack: np.ndarray, x_center: int, y_center: int) -> np.ndarray:
         """Extract patch with zero padding for cells near borders."""
         image_height, image_width = he_stack.shape[:2]
@@ -221,6 +291,87 @@ class XeniumPatchExtractor:
                 he_stack[img_y_start:img_y_end, img_x_start:img_x_end]
         
         return patch
+
+    def visualize_neighbor_filtered_patches(self, he_stack: np.ndarray, filtered_cells_info: dict,
+                                          matrix_df: pd.DataFrame, sample_name: str, n_examples: int = 20):
+        """Visualize patches of cells filtered out due to low neighbor density."""
+        
+        filtered_cells = filtered_cells_info['cells_df']
+        neighbor_counts = filtered_cells_info['neighbor_counts']
+        
+        if len(filtered_cells) == 0:
+            return
+            
+        n_examples = min(n_examples, len(filtered_cells))
+        print(f"Visualizing {n_examples} neighbor-filtered cells...")
+        
+        # Transform coordinates to H&E space
+        centroids = filtered_cells[['x_centroid', 'y_centroid']].values
+        pixel_centroids = centroids / self.pixel_size
+        centroids_transformed = self.transform_coords_inverse(matrix_df, pixel_centroids)
+        x_trans = centroids_transformed[:, 0].astype(int)
+        y_trans = centroids_transformed[:, 1].astype(int)
+        
+        # Randomly select examples, but prioritize the most isolated cells
+        sorted_indices = np.argsort(neighbor_counts)  # Most isolated first
+        if n_examples <= len(sorted_indices) // 2:
+            # Show the most isolated cells
+            example_indices = sorted_indices[:n_examples]
+        else:
+            # Mix of most isolated and random
+            most_isolated = sorted_indices[:n_examples//2]
+            remaining = np.random.choice(sorted_indices[n_examples//2:], 
+                                       n_examples - len(most_isolated), replace=False)
+            example_indices = np.concatenate([most_isolated, remaining])
+        
+        # Setup visualization
+        n_cols = 5
+        n_rows = (n_examples + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1) if n_cols > 1 else np.array([[axes]])
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # Extract and display example patches
+        for idx in range(n_examples):
+            row = idx // n_cols
+            col = idx % n_cols
+            ax = axes[row, col]
+            
+            # Get coordinates for this example
+            example_idx = example_indices[idx]
+            x_center = x_trans[example_idx]
+            y_center = y_trans[example_idx]
+            neighbors = neighbor_counts[example_idx]
+            
+            # Extract patch with zero padding
+            patch = self.extract_patch_with_padding(he_stack, x_center, y_center)
+            
+            # Display patch
+            ax.imshow(patch)
+            ax.scatter(self.half_patch, self.half_patch, s=80, c='red', alpha=0.8, marker='x')
+            ax.set_title(f'Neighbors: {neighbors}', fontsize=10)
+            ax.axis('off')
+        
+        # Hide unused subplots
+        for idx in range(n_examples, n_rows * n_cols):
+            row = idx // n_cols
+            col = idx % n_cols
+            axes[row, col].axis('off')
+        
+        plt.tight_layout()
+        plt.suptitle(f'{sample_name}: {n_examples} Neighbor-Filtered Cells (Low Density)', fontsize=16, y=1.02)
+        plt.show()
+        
+        # Print statistics about filtered cells
+        print(f"\nNeighbor filtering statistics:")
+        print(f"  Cells with 0 neighbors: {np.sum(neighbor_counts == 0)}")
+        print(f"  Cells with 1-2 neighbors: {np.sum((neighbor_counts >= 1) & (neighbor_counts <= 2))}")
+        print(f"  Cells with 3-4 neighbors: {np.sum((neighbor_counts >= 3) & (neighbor_counts <= 4))}")
+        print(f"  Mean neighbors in filtered cells: {np.mean(neighbor_counts):.1f}")
+        print(f"  Most isolated cell has {np.min(neighbor_counts)} neighbors")
 
     def visualize_filtered_patches(self, he_stack: np.ndarray, filtered_x: np.ndarray, 
                                  filtered_y: np.ndarray, filtered_indices: np.ndarray,
@@ -331,7 +482,10 @@ class XeniumPatchExtractor:
         plt.suptitle(f'{sample_name}: {n_examples} Random Single Cell Patches', fontsize=16, y=1.02)
         plt.show()
 
-    def extract_patches_for_sample(self, sample_name: str, sample_files: Dict[str, Path], visualize: bool = True, n_examples: int = 20, min_neighbors: int = 5, radius: float = 50.0) -> bool:
+    def extract_patches_for_sample(self, sample_name: str, sample_files: Dict[str, Path], 
+                                 visualize: bool = True, n_examples: int = 20, 
+                                 min_neighbors: int = 5, radius: float = 50.0, 
+                                 analyze_radius: bool = False) -> bool:
         """Extract single cell patches for one sample."""
         
         print(f"\n{'='*60}")
@@ -359,19 +513,24 @@ class XeniumPatchExtractor:
                     print("No cells remaining after QC filtering")
                     return False
             
-            # === Step 3.5: Apply neighbor density filtering ===
+            # === Step 3.5: Analyze radius effect (optional) ===
+            if analyze_radius and visualize:
+                self.analyze_radius_effect(cells_df, sample_name)
+            
+            # === Step 4: Apply neighbor density filtering ===
+            filtered_cells_info = None
             if min_neighbors > 0:
-                cells_df = self.apply_neighbor_density_filter(cells_df, min_neighbors, radius, 
-                                                            sample_name, visualize)
+                cells_df, filtered_cells_info = self.apply_neighbor_density_filter(
+                    cells_df, min_neighbors, radius, sample_name, visualize)
                 if len(cells_df) == 0:
                     print("No cells remaining after neighbor density filtering")
                     return False
             
-            # === Step 4: Extract centroids directly from CSV ===
+            # === Step 5: Extract centroids directly from CSV ===
             centroids = cells_df[['x_centroid', 'y_centroid']].values
             print(f"Extracted centroids: {centroids.shape}")
             
-            # === Step 5: Transform coordinates ===
+            # === Step 6: Transform coordinates ===
             print("Transforming coordinates...")
             pixel_centroids = centroids / self.pixel_size
             centroids_transformed = self.transform_coords_inverse(matrix_df, pixel_centroids)
@@ -379,7 +538,7 @@ class XeniumPatchExtractor:
             y_trans = centroids_transformed[:, 1].astype(int)
             print(f"Transformed {len(centroids)} cell centroids to H&E space")
             
-            # === Step 6: Load H&E image ===
+            # === Step 7: Load H&E image ===
             print("Loading H&E image...")
             print(f"H&E file path: {sample_files['he_image']}")
             print(f"File size: {sample_files['he_image'].stat().st_size / (1024**3):.2f} GB")
@@ -395,7 +554,6 @@ class XeniumPatchExtractor:
                 print(f"Error loading H&E image: {e}")
                 print("Trying alternative loading method...")
                 try:
-                    # Try reading with different method
                     import tifffile as tf
                     with tf.TiffFile(sample_files['he_image']) as tif:
                         print(f"TIFF info: {tif.series[0].shape}, {tif.series[0].dtype}")
@@ -407,7 +565,7 @@ class XeniumPatchExtractor:
             
             image_height, image_width = he_stack.shape[:2]
             
-            # === Step 7: Filter valid cells ===
+            # === Step 8: Filter valid cells (boundary filtering) ===
             print("Filtering valid cells...")
             valid_mask = (
                 (x_trans >= self.half_patch) & (x_trans < image_width - self.half_patch) &
@@ -418,28 +576,28 @@ class XeniumPatchExtractor:
             valid_y = y_trans[valid_mask]
             valid_indices = np.where(valid_mask)[0]
             
-            # Get filtered out cells
-            filtered_x = x_trans[~valid_mask]
-            filtered_y = y_trans[~valid_mask]
-            filtered_indices = np.where(~valid_mask)[0]
+            # Get boundary-filtered cells
+            boundary_filtered_x = x_trans[~valid_mask]
+            boundary_filtered_y = y_trans[~valid_mask]
+            boundary_filtered_indices = np.where(~valid_mask)[0]
             
             print(f"Found {len(valid_x)} valid cells out of {len(x_trans)} total cells")
-            print(f"Filtered out {len(filtered_x)} cells too close to boundaries")
+            print(f"Filtered out {len(boundary_filtered_x)} cells too close to boundaries")
 
             if len(valid_x) == 0:
                 print("No valid cells found for this sample")
                 return False
             
-            # === Step 8: Calculate patch coordinates ===
+            # === Step 9: Calculate patch coordinates ===
             patch_x_starts = valid_x - self.half_patch
             patch_y_starts = valid_y - self.half_patch
             
-            # === Step 9: Create output directory ===
+            # === Step 10: Create output directory ===
             sample_output_dir = self.output_dir / sample_name
             sample_output_dir.mkdir(parents=True, exist_ok=True)
             print(f"Created output directory: {sample_output_dir}")
             
-            # === Step 10: Save coordinates to h5 file ===
+            # === Step 11: Save coordinates to h5 file ===
             h5_path = sample_output_dir / "patch_coordinates.h5"
             with h5py.File(h5_path, 'w') as f:
                 f.create_dataset('x_start', data=patch_x_starts)
@@ -451,18 +609,31 @@ class XeniumPatchExtractor:
                 f.attrs['image_shape'] = he_stack.shape
                 f.attrs['sample_name'] = sample_name
                 f.attrs['pixel_size'] = self.pixel_size
+                f.attrs['min_neighbors'] = min_neighbors
+                f.attrs['radius'] = radius
                 
             print(f"Saved {len(valid_x)} patch coordinates to {h5_path}")
             
-            # === Step 11: Visualize examples ===
-            if visualize and len(valid_x) > 0:
-                self.visualize_example_patches(he_stack, patch_x_starts, patch_y_starts, 
-                                             valid_indices, sample_name, n_examples)
-            
-            # === Step 12: Visualize filtered cells ===
-            if visualize and len(filtered_x) > 0:
-                self.visualize_filtered_patches(he_stack, filtered_x, filtered_y, 
-                                               filtered_indices, sample_name, n_examples)
+            # === Step 12: Visualizations ===
+            if visualize:
+                if args.show_neighbor_filtered_only:
+                    # ONLY show neighbor-filtered cells
+                    if filtered_cells_info is not None and len(filtered_cells_info['cells_df']) > 0:
+                        self.visualize_neighbor_filtered_patches(he_stack, filtered_cells_info, 
+                                                                matrix_df, sample_name, n_examples)
+                else:
+                    # Show all visualizations (current behavior)
+                    if len(valid_x) > 0:
+                        self.visualize_example_patches(he_stack, patch_x_starts, patch_y_starts, 
+                                                    valid_indices, sample_name, n_examples)
+                    
+                    if len(boundary_filtered_x) > 0:
+                        self.visualize_filtered_patches(he_stack, boundary_filtered_x, boundary_filtered_y, 
+                                                    boundary_filtered_indices, sample_name, n_examples)
+                    
+                    if filtered_cells_info is not None and len(filtered_cells_info['cells_df']) > 0:
+                        self.visualize_neighbor_filtered_patches(he_stack, filtered_cells_info, 
+                                                                matrix_df, sample_name, n_examples)
             
             return True
             
@@ -525,7 +696,8 @@ class XeniumPatchExtractor:
         print(f"- All files appear accessible")
     
     def process_all_samples(self, visualize: bool = True, n_examples: int = 20,
-                        min_neighbors: int = 5, radius: float = 50.0):       
+                        min_neighbors: int = 5, radius: float = 50.0, 
+                        analyze_radius: bool = False):       
         """Process all available samples."""
         
         # Find all sample files
@@ -544,7 +716,7 @@ class XeniumPatchExtractor:
         
         for sample_name, sample_files in samples.items():
             success = self.extract_patches_for_sample(sample_name, sample_files, visualize, 
-                                                    n_examples, min_neighbors, radius)
+                                                    n_examples, min_neighbors, radius, analyze_radius)
             if success:
                 successful += 1
             else:
@@ -596,8 +768,12 @@ if __name__ == "__main__":
                     help="Radius for neighbor counting")
     parser.add_argument("--check_files_only", action="store_true", 
                    help="Only check file accessibility without processing")
+    parser.add_argument("--analyze_radius", action="store_true", 
+                   help="Analyze different radius values before processing")
     parser.add_argument("--debug", action="store_true", 
                    help="Enable debug mode with extra information")
+    parser.add_argument("--show_neighbor_filtered_only", action="store_true", 
+               help="Only visualize neighbor-filtered cells")
 
     args = parser.parse_args()
 
@@ -618,7 +794,8 @@ if __name__ == "__main__":
             visualize=not args.no_visualize,
             n_examples=args.n_examples,
             min_neighbors=args.min_neighbors,
-            radius=args.radius
+            radius=args.radius,
+            analyze_radius=args.analyze_radius
         )
     
     print(f"\nTo load coordinates later, use:")
